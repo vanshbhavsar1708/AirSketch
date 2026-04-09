@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Hand-Pen</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <style>
+    body { margin: 0; background: #050301; overflow: hidden; }
+    video { display: none; }
+    canvas { width: 100%; height: 100%; transform: scaleX(-1); position: absolute; z-index: 1; }
+  </style>
+</head>
+<body>
+  <video id="vid"></video>
+  <canvas id="c"></canvas>
+  <script>
+    var vid = document.getElementById('vid');
+    var c = document.getElementById('c');
+    var ctx = c.getContext('2d');
+    var arr = [];
+    var cur = [];
+    var shift = false;
+    var draw = false;
+    var sx = null;
+    var sy = null;
+    var ctrl = false;
+    var mKey = false;
+    var sKey = false;
+    var scale = 1;
+    var offsetX = 0;
+    var offsetY = 0;
+    var undoStack = [];
+    var redoStack = [];
+    var prevCenter = null;
+    var prevDist = null;
+    var prevMoveX = null;
+    var prevMoveY = null;
+    var prevThumbIndexDist = null;
+    var gestureActive = false;
+
+    window.onkeydown = function(e) {
+      if (e.key == 'Shift') shift = true;
+      if (e.key == 'Control') ctrl = true;
+      if (e.key.toLowerCase() == 'm') mKey = true;
+      if (e.key.toLowerCase() == 's') sKey = true;
+      if (e.code == 'Space') arr = [];
+      if (e.ctrlKey && e.key == 'z' && arr.length > 0) {
+        undoStack.push(arr.pop());
+      }
+      if (e.ctrlKey && e.key == 'y' && undoStack.length > 0) {
+        arr.push(undoStack.pop());
+      }
+      // Arrow keys to shift drawing and zoom shortcuts
+      if (!shift && !ctrl && !mKey && !sKey) {
+        if (e.key == 'ArrowUp') { offsetY -= 10; e.preventDefault(); }
+        if (e.key == 'ArrowDown') { offsetY += 10; e.preventDefault(); }
+        if (e.key == 'ArrowLeft') { offsetX -= 10; e.preventDefault(); }
+        if (e.key == 'ArrowRight') { offsetX += 10; e.preventDefault(); }
+        if (e.key == '+') { scale *= 1.1; e.preventDefault(); }
+        if (e.key == '-') { scale *= 0.9; e.preventDefault(); }
+        if (e.key.toLowerCase() == 'i') { scale *= 1.1; e.preventDefault(); }
+        if (e.key.toLowerCase() == 'o') { scale *= 0.9; e.preventDefault(); }
+      }
+    }
+    
+    window.onkeyup = function(e) {
+      if (e.key == 'Shift') shift = false;
+      if (e.key == 'Control') ctrl = false;
+      if (e.key.toLowerCase() == 'm') mKey = false;
+      if (e.key.toLowerCase() == 's') sKey = false;
+    }
+
+    function run(res) {
+      c.width = window.innerWidth;
+      c.height = window.innerHeight;
+      ctx.drawImage(res.image, 0, 0, c.width, c.height);
+      ctx.fillStyle = 'rgba(10, 6, 2, 0.85)';
+      ctx.fillRect(0, 0, c.width, c.height);
+
+      ctx.shadowColor = '#F5D061';
+      ctx.shadowBlur = 15;
+      ctx.strokeStyle = '#F5D061';
+      ctx.lineWidth = 6;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      ctx.save();
+      ctx.translate(offsetX, offsetY);
+      ctx.scale(scale, scale);
+
+      for (var i = 0; i < arr.length; i++) {
+        ctx.beginPath();
+        for (var j = 0; j < arr[i].length; j++) {
+          if (j == 0) ctx.moveTo(arr[i][j].x, arr[i][j].y);
+          else ctx.lineTo(arr[i][j].x, arr[i][j].y);
+        }
+        ctx.stroke();
+      }
+
+      ctx.restore();
+
+      if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
+        var lm = res.multiHandLandmarks[0];
+        drawConnectors(ctx, lm, HAND_CONNECTIONS, {color: 'rgba(245, 208, 97, 0.3)', lineWidth: 2});
+        drawLandmarks(ctx, lm, {color: '#FFFFFF', lineWidth: 1, radius: 2});
+
+        // Gesture detection
+        var thumbTip = lm[4];
+        var thumbIp = lm[3];
+        var indexTip = lm[8];
+        var indexPip = lm[6];
+        var middleTip = lm[12];
+        var middlePip = lm[10];
+        var ringTip = lm[16];
+        var ringPip = lm[14];
+        var pinkyTip = lm[20];
+        var pinkyPip = lm[18];
+
+        var isThumbUp = thumbTip.y < thumbIp.y;
+        var isThumbDown = thumbTip.y > thumbIp.y;
+        var isIndexExtended = indexTip.y < indexPip.y;
+        var isMiddleExtended = middleTip.y < middlePip.y;
+        var isRingExtended = ringTip.y < ringPip.y;
+        var isPinkyExtended = pinkyTip.y < pinkyPip.y;
+        var isThumbCurled = thumbTip.y > thumbIp.y;
+
+        if (ctrl && isThumbDown && arr.length > 0) {
+          undoStack.push(arr.pop());
+        }
+        if (ctrl && isThumbUp && undoStack.length > 0) {
+          arr.push(undoStack.pop());
+        }
+
+        var indexPos = {x: indexTip.x * c.width, y: indexTip.y * c.height};
+        var thumbIndexDist = Math.hypot((thumbTip.x - indexTip.x) * c.width, (thumbTip.y - indexTip.y) * c.height);
+
+        if (mKey && isIndexExtended && !isMiddleExtended && !isRingExtended && !isPinkyExtended) {
+          if (prevMoveX === null || prevMoveY === null) {
+            prevMoveX = indexPos.x;
+            prevMoveY = indexPos.y;
+          } else {
+            offsetX += indexPos.x - prevMoveX;
+            offsetY += indexPos.y - prevMoveY;
+            prevMoveX = indexPos.x;
+            prevMoveY = indexPos.y;
+          }
+        } else {
+          prevMoveX = null;
+          prevMoveY = null;
+        }
+
+        if (sKey) {
+          if (prevThumbIndexDist === null) {
+            prevThumbIndexDist = thumbIndexDist;
+          } else {
+            var zoomDelta = thumbIndexDist / prevThumbIndexDist;
+            zoomDelta = Math.max(0.95, Math.min(1.05, zoomDelta));
+            scale *= zoomDelta;
+            scale = Math.max(0.1, Math.min(10, scale));
+            prevThumbIndexDist = thumbIndexDist;
+          }
+        } else {
+          prevThumbIndexDist = null;
+        }
+
+        if (shift && isIndexExtended && isMiddleExtended && isRingExtended && isPinkyExtended && isThumbCurled) {
+          // 4 fingers without thumb for resize and shift
+          var fingers = [indexTip, middleTip, ringTip, pinkyTip];
+          var points = fingers.map(f => ({x: f.x * c.width, y: f.y * c.height}));
+          
+          // Calculate center
+          var sumX = 0, sumY = 0;
+          for (var p of points) {
+            sumX += p.x;
+            sumY += p.y;
+          }
+          var centerX = sumX / 4;
+          var centerY = sumY / 4;
+          
+          // Calculate max distance between any two fingers for scale
+          var maxDist = 0;
+          for (var i = 0; i < points.length; i++) {
+            for (var j = i + 1; j < points.length; j++) {
+              var dx = points[i].x - points[j].x;
+              var dy = points[i].y - points[j].y;
+              var dist = Math.sqrt(dx * dx + dy * dy);
+              if (dist > maxDist) maxDist = dist;
+            }
+          }
+
+          if (!gestureActive) {
+            prevCenter = { x: centerX, y: centerY };
+            prevDist = maxDist;
+            gestureActive = true;
+          } else {
+            var deltaX = centerX - prevCenter.x;
+            var deltaY = centerY - prevCenter.y;
+            var deltaScale = maxDist / prevDist;
+            deltaScale = Math.max(0.95, Math.min(1.05, deltaScale)); // limit change per frame
+            offsetX += deltaX;
+            offsetY += deltaY;
+            scale *= deltaScale;
+            scale = Math.max(0.1, Math.min(10, scale)); // limit scale
+            prevCenter.x = centerX;
+            prevCenter.y = centerY;
+            prevDist = maxDist;
+          }
+        } else {
+          gestureActive = false;
+        }
+
+        var ind = lm[8];
+        var rx = ind.x * c.width;
+        var ry = ind.y * c.height;
+
+        if (sx == null) {
+          sx = rx; 
+          sy = ry;
+        } else {
+          sx += (rx - sx) * 0.45;
+          sy += (ry - sy) * 0.45;
+        }
+
+        ctx.beginPath();
+        ctx.arc(sx, sy, 6, 0, 2 * Math.PI);
+        if (shift) { 
+          ctx.fillStyle = '#FFFFFF'; 
+        } else { 
+          ctx.fillStyle = 'rgba(245, 208, 97, 0.4)'; 
+        }
+        ctx.fill();
+
+        if (shift) {
+          if (!draw) {
+            draw = true;
+            cur = [];
+            arr.push(cur);
+          }
+          cur.push({x: sx, y: sy});
+        } else {
+          draw = false;
+        }
+      } else {
+        draw = false;
+        sx = null;
+      }
+    }
+
+    var h = new Hands({
+      locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+      }
+    });
+    
+    h.setOptions({ 
+      maxNumHands: 1, 
+      modelComplexity: 1, 
+      minDetectionConfidence: 0.5, 
+      minTrackingConfidence: 0.5 
+    });
+    
+    h.onResults(run);
+
+    var cam = new Camera(vid, {
+      onFrame: async () => { await h.send({image: vid}); },
+      width: 1280, 
+      height: 720
+    });
+    
+    cam.start();
+  </script>
+</body>
+
+</html>
